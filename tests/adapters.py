@@ -452,7 +452,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -589,4 +591,116 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # 1. vocabulary initialization
+    init_vocab_size = (
+        256
+        if vocab_size - len(special_tokens) >= 256
+        else vocab_size - len(special_tokens)
+    )
+    special_tokens = tuple(special_tokens)
+
+    vocab = {}
+    for st in special_tokens:
+        vocab[len(vocab)] = st.encode("utf-8")
+
+    for i in range(init_vocab_size):
+        vocab[len(vocab)] = bytes([i])
+
+    # 2. initial pre_tokens and freq_table
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    freq_table = {}
+    import regex as re
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Split content by special tokens to ensure they are not split by BPE
+    if special_tokens:
+        # Create a regex pattern to split by any of the special tokens
+        special_tokens_pat = "(" + "|".join(re.escape(t) for t in special_tokens) + ")"
+        parts = re.split(special_tokens_pat, content)
+    else:
+        parts = [content]
+
+    for part in parts:
+        if part in special_tokens:
+            # Special tokens are treated as a single unit
+            pre_token = (part.encode("utf-8"),)
+            freq_table[pre_token] = freq_table.get(pre_token, 0) + 1
+        else:
+            # Apply GPT-2 pre-tokenization to non-special token parts
+            for match in re.finditer(PAT, part):
+                # Convert string match to a tuple of individual bytes
+                pre_token = tuple(bytes([b]) for b in match.group(0).encode("utf-8"))
+                freq_table[pre_token] = freq_table.get(pre_token, 0) + 1
+
+    # 3. train BPE
+    def compute_byte_pair(token: tuple[bytes]):
+        if len(token) < 2:
+            return {}
+
+        bfreq_table = {}
+        pre_b = token[0]
+        for po_b in token[1:]:
+            k = (pre_b, po_b)
+            if k in bfreq_table:
+                bfreq_table[k] += 1
+            else:
+                bfreq_table[k] = 1
+            pre_b = po_b
+        return bfreq_table
+
+    merges = []
+    while len(vocab) < vocab_size:
+        bp_freq_table = {}
+        for token, v in freq_table.items():
+            if token in special_tokens:
+                continue
+
+            token_bfreq = compute_byte_pair(token)
+
+            for bk, bv in token_bfreq.items():
+                if bk in bp_freq_table:
+                    bp_freq_table[bk] += bv * v
+                else:
+                    bp_freq_table[bk] = bv * v
+
+        # there no pair to merge
+        if not bp_freq_table:
+            break
+
+        sorted_bp_freq_table = sorted(
+            bp_freq_table.items(), key=lambda item: (item[0]), reverse=True
+        )
+
+        top_freq_pair = sorted(sorted_bp_freq_table, key=lambda item: (-item[1]))[0]
+
+        pre_pair = top_freq_pair[0][0]
+        post_pair = top_freq_pair[0][1]
+
+        merges.append((pre_pair, post_pair))
+        new_token = pre_pair + post_pair
+        vocab[len(vocab)] = new_token
+
+        new_freq_table = {}
+
+        # update freq_table
+        for token, freq in freq_table.items():
+            new_token = []
+            i = 0
+            while i < len(token):
+                if (
+                    i < len(token) - 1
+                    and token[i] == pre_pair
+                    and token[i + 1] == post_pair
+                ):
+                    new_token.append(token[i] + token[i + 1])
+                    i += 2
+                else:
+                    new_token.append(token[i])
+                    i += 1
+            new_freq_table[tuple(new_token)] = freq
+
+        freq_table = new_freq_table
+
+    return (vocab, merges)
